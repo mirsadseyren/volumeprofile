@@ -1,0 +1,10 @@
+
+pandas
+pandas_ta
+yfinance
+numpy
+plotly
+numba
+matplotlib
+streamlit>=1.42.0
+numba>=0.61.2
