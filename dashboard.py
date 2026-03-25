@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import time
-import yfinance as yf
+import tempfile
 from scanner import read_tickers, calculate_poc
 
 st.set_page_config(
@@ -390,10 +390,10 @@ if run:
         st.markdown("<div class='section-title'>📊 Tablo Görünümü</div>", unsafe_allow_html=True)
         st.dataframe(df_signals, use_container_width=True, hide_index=True)
 
-        excel_buf = pd.ExcelWriter("/tmp/sinyaller.xlsx", engine="openpyxl")
-        df_signals.to_excel(excel_buf, index=False, sheet_name="Sinyaller")
-        excel_buf.close()
-        with open("/tmp/sinyaller.xlsx", "rb") as f:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            tmp_path = tmp.name
+        df_signals.to_excel(tmp_path, index=False, sheet_name="Sinyaller", engine="openpyxl")
+        with open(tmp_path, "rb") as f:
             st.download_button(
                 "⬇️ Excel Olarak İndir",
                 data=f.read(),
