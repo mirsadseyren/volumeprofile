@@ -4,7 +4,6 @@ import numpy as np
 import os
 import time
 import tempfile
-from scanner import read_tickers, calculate_poc
 
 st.set_page_config(
     page_title="POC Sinyal Tarayıcı",
