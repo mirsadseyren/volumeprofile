@@ -4,6 +4,7 @@ import numpy as np
 import os
 import time
 import tempfile
+import yfinance as yf
 
 st.set_page_config(
     page_title="POC Sinyal Tarayıcı",
@@ -170,7 +171,7 @@ div[data-testid="stMetric"] div   { color: #fff !important; }
 """, unsafe_allow_html=True)
 
 
-# ─── Yardımcı: Volume Density hesabı ───────────────────────────────────────
+# ─── Yardımcı: Volume Density hesabı ────────────────────────────────────────────
 def compute_poc_density(close_series, vol_series, bins=50):
     valid = pd.concat([close_series, vol_series], axis=1).dropna()
     if valid.empty or valid.iloc[:,0].min() == valid.iloc[:,0].max():
@@ -191,7 +192,73 @@ def compute_poc_density(close_series, vol_series, bins=50):
     return poc_px, density
 
 
-# ─── Ana tarama fonksiyonu (BUGÜNÜN verisiyle YARIN alınacaklar) ────────────
+# ─── Veri İndirme Fonksiyonu ─────────────────────────────────────────────────────
+def read_tickers_from_file(filename="stox.txt"):
+    tickers = []
+    if not os.path.exists(filename):
+        return []
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or len(line) > 7 or " " in line:
+                continue
+            line = line.rstrip('.')
+            tickers.append(line + ".IS")
+    return list(set(tickers))
+
+
+def fetch_and_update_data(progress_cb=None):
+    """yfinance'den taze veri çekip session_state'e kaydeder."""
+    tickers = read_tickers_from_file("stox.txt")
+    if not tickers:
+        return False, "stox.txt bulunamadı veya boş!"
+
+    chunk_size = 100
+    dfs_intraday = []
+    dfs_daily    = []
+    total_chunks = (len(tickers) // chunk_size) + 1
+
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i+chunk_size]
+        grp = i // chunk_size + 1
+        if progress_cb:
+            progress_cb(i / len(tickers) * 0.7, f"5G İntra-günlük veri: Grup {grp}/{total_chunks}")
+        try:
+            d = yf.download(chunk, period="5d", interval="1m", progress=False)
+            if not d.empty and isinstance(d.columns, pd.MultiIndex):
+                cols = [c for c in d.columns if c[0] in ['Close', 'Volume']]
+                dfs_intraday.append(d[cols])
+        except:
+            pass
+        time.sleep(0.3)
+
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i+chunk_size]
+        grp = i // chunk_size + 1
+        if progress_cb:
+            progress_cb(0.7 + i / len(tickers) * 0.3, f"Aylık Günlük veri: Grup {grp}/{total_chunks}")
+        try:
+            d = yf.download(chunk, period="1mo", interval="1d", progress=False)
+            if not d.empty and isinstance(d.columns, pd.MultiIndex):
+                cols = [c for c in d.columns if c[0] == 'Close']
+                dfs_daily.append(d[cols])
+        except:
+            pass
+        time.sleep(0.3)
+
+    if not dfs_intraday:
+        return False, "5 günlük veri indirilemedi!"
+
+    st.session_state["intraday_data"] = pd.concat(dfs_intraday, axis=1)
+    st.session_state["daily_data"]    = pd.concat(dfs_daily, axis=1) if dfs_daily else None
+    st.session_state["data_fetched_at"] = time.strftime("%d.%m.%Y %H:%M")
+
+    if progress_cb:
+        progress_cb(1.0, "Veri güncellendi!")
+    return True, None
+
+
+# ─── Ana tarama fonksiyonu (BUGUNÜN verisiyle YARIN alınacaklar) ────────────
 def find_signals(
     intraday_cache="bist_all_backtest_cache.pkl",
     daily_cache="bist_daily_1mo_cache.pkl",
@@ -199,10 +266,13 @@ def find_signals(
     density_threshold=0.10,
     progress_cb=None,
 ):
-    if not os.path.exists(intraday_cache):
-        return None, "⚠️ Önbellek bulunamadı. Lütfen main.py'i çalıştırarak verileri indirin."
-
-    data = pd.read_pickle(intraday_cache)
+    # Önce session_state'den oku (Cloud ve lokal uyumlu)
+    if "intraday_data" in st.session_state:
+        data = st.session_state["intraday_data"]
+    elif os.path.exists(intraday_cache):
+        data = pd.read_pickle(intraday_cache)
+    else:
+        return None, "⚠️ Veri bulunamadı. Lütfen '📥 Veriyi Güncelle' butonuna basın."
     dates = pd.Series(data.index).dt.normalize().unique()
     if len(dates) < 1:
         return None, "Yeterli veri yok!"
@@ -211,11 +281,19 @@ def find_signals(
     today_mask = data.index.normalize() == today_date
     df_today = data.loc[today_mask]
 
-    # Aylık filtre ─────────────────────────────────────────────────────────
+    # Aylık filtre ─────────────────────────────────────────────────────
     valid_monthly = set()
-    if os.path.exists(daily_cache):
+    # session_state'den veya pickle'dan oku
+    daily = None
+    if "daily_data" in st.session_state and st.session_state["daily_data"] is not None:
+        daily = st.session_state["daily_data"]
+    elif os.path.exists(daily_cache):
         try:
             daily = pd.read_pickle(daily_cache)
+        except:
+            pass
+    if daily is not None:
+        try:
             for t in set(daily.columns.get_level_values(1)):
                 if ('Close', t) in daily.columns:
                     s = daily['Close'][t].dropna()
@@ -294,10 +372,47 @@ with st.sidebar:
     monthly_thresh = st.slider("Aylık Getiri Eşiği (%)", 5, 100, 30, 5)
     density_thresh = st.slider("POC Yoğunluk Eşiği (%)", 1, 50, 10, 1) / 100.0
     st.markdown("---")
+    st.markdown("### 📥 Veri Güncelleme")
+
+    fetched_at = st.session_state.get("data_fetched_at", None)
+    if fetched_at:
+        st.markdown(
+            f"<div style='color:#34d399; font-size:0.82rem; margin-bottom:8px;'>"
+            f"✅ Son güncelleme: <b>{fetched_at}</b></div>",
+            unsafe_allow_html=True
+        )
+    elif os.path.exists("bist_all_backtest_cache.pkl"):
+        mtime = os.path.getmtime("bist_all_backtest_cache.pkl")
+        mod_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(mtime))
+        st.markdown(
+            f"<div style='color:#fbbf24; font-size:0.82rem; margin-bottom:8px;'>"
+            f"📦 Yerel önbelleğ: <b>{mod_str}</b></div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            "<div style='color:#f87171; font-size:0.82rem; margin-bottom:8px;'>"
+            "⚠️ Veri yok — aşağıdan güncelleyin.</div>",
+            unsafe_allow_html=True
+        )
+
+    fetch_btn = st.button("📥 Veriyi Güncelle (yfinance)")
+    if fetch_btn:
+        fetch_prog = st.progress(0, text="Veri indiriliyor...")
+        ok, err_msg = fetch_and_update_data(
+            progress_cb=lambda v, m: fetch_prog.progress(v, text=m)
+        )
+        fetch_prog.empty()
+        if ok:
+            st.success("✅ Veri başarıyla güncellendi!")
+        else:
+            st.error(f"❌ Hata: {err_msg}")
+
+    st.markdown("---")
     st.markdown(
         "<div style='color:rgba(255,255,255,0.4); font-size:0.78rem;'>"
-        "Veri kaynağı: <code>bist_all_backtest_cache.pkl</code><br>"
-        "Yenilemek için main.py'i çalıştırın.</div>",
+        "Cloud'da 📥 butonu ile güncelleyin.<br>"
+        "Yerelde önbelleğ otomatik kullanılır.</div>",
         unsafe_allow_html=True
     )
 
@@ -307,7 +422,12 @@ with col_btn:
     run = st.button("🔍 Taramayı Başlat")
 
 with col_info:
-    if not os.path.exists("bist_all_backtest_cache.pkl"):
+    if st.session_state.get("data_fetched_at", None):
+        st.markdown(
+            f"<div class='info-box'>📦 Önbellek: <b>{st.session_state['data_fetched_at']}</b> tarihli veriler kullanılıyor.</div>",
+            unsafe_allow_html=True
+        )
+    elif not os.path.exists("bist_all_backtest_cache.pkl"):
         st.markdown(
             "<div class='warning-box'>⚠️ Önbellek dosyası bulunamadı. "
             "Lütfen önce <code>main.py</code> çalıştırın.</div>",
